@@ -1,17 +1,7 @@
-"""InnerLog's sentiment agent (local Ollama or Hugging Face inference).
+"""InnerLog sentiment agent using Hugging Face Inference Providers.
 
-Setup:
-    Install and start Ollama: https://ollama.com/download
-    ollama pull qwen3:4b-instruct-2507-q4_K_M
-    python sentiment_agent.py --demo
 
-Application use:
-    from sentiment_agent import SentimentAgent, SentimentAgentError
-    agent = SentimentAgent()
-    result = agent.analyze(journal_content)
-    print(result.to_dict())
-
-The configured inference provider receives the journal text. No history is retained by
+Hugging Face Inference Providers receive the journal text. No history is retained by
 this module and no journal text is logged. Analysis is a prediction of text tone,
 not a mental health diagnosis. Validate accuracy with your own journal examples.
 """
@@ -23,15 +13,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 import os
-from old_llm_model_inference import generate_response, inference_provider
 import sys
-from urllib.error import HTTPError, URLError
-from urllib.request import (
-    HTTPRedirectHandler, ProxyHandler, Request, build_opener,
-)
+from difflib import SequenceMatcher
 
-DEFAULT_MODEL = "qwen3:4b"
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+from huggingface_hub import InferenceClient
 # Conservative MVP limit to keep the full entry in the configured context.
 # Oversize entries are rejected, never silently truncated.
 MAX_INPUT_BYTES = 6000
@@ -89,12 +74,6 @@ class _InvalidOutput(ValueError):
     pass
 
 
-class _NoRedirects(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Never forward journal content to a redirected endpoint.
-        return None
-
-
 @dataclass(frozen=True)
 class SentimentResult:
     sentiment: str
@@ -111,9 +90,6 @@ class SentimentResult:
         data["emotions"] = list(self.emotions)
         data["evidence"] = list(self.evidence)
         return data
-
-from difflib import SequenceMatcher
-
 
 def repair_evidence(evidence, original_text):
     repaired = []
@@ -160,8 +136,8 @@ class SentimentAgent:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
         self.timeout = timeout
-        self.model = (os.getenv("HF_SENTIMENT_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
-                      if inference_provider() == "huggingface" else DEFAULT_MODEL)
+        self.model = os.getenv("HF_SENTIMENT_MODEL", "Qwen/Qwen3.5-9B:cheapest").strip()
+        self.provider = os.getenv("HF_INFERENCE_PROVIDER", "auto").strip() or "auto"
 
     def analyze(self, text: str) -> SentimentResult:
         if not isinstance(text, str) or not text.strip():
@@ -182,44 +158,27 @@ class SentimentAgent:
                     "\nPrevious output failed validation. Follow the schema exactly "
                     "and copy evidence verbatim from the journal."
                 )
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT + reminder
-                        + "\nJSON schema: " + json.dumps(OUTPUT_SCHEMA)
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {"journal_entry": text},
-                            ensure_ascii=False
-                        )
-                    }
-                ],
-                "format": OUTPUT_SCHEMA,
-                "stream": False,
-                "think": False,
-                "options": {
-                    "temperature": 0,
-                    "num_ctx": 8192,
-                    "num_predict": 1024
-                }
-            }
+            messages = [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT + reminder
+                    + "\nJSON schema: " + json.dumps(OUTPUT_SCHEMA),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"journal_entry": text}, ensure_ascii=False),
+                },
+            ]
             try:
-                response = self._request(payload)
-                if response.get("done") is not True:
-                    raise _InvalidOutput("Incomplete response")
-                if response.get("done_reason") == "length":
-                    raise _InvalidOutput("Output token limit reached")
-                message = response.get("message")
-                if not isinstance(message, dict):
-                    raise _InvalidOutput("Missing message")
-                content = message.get("content")
-                if not isinstance(content, str):
-                    raise _InvalidOutput("Missing content")
-
+                content = self._request(messages)
+                if not isinstance(content, str) or not content.strip():
+                    raise _InvalidOutput("Missing response content")
+                # Some providers wrap JSON in markdown fences despite the prompt.
+                content = content.strip()
+                if content.startswith("```"):
+                    lines = content.splitlines()
+                    if len(lines) >= 3 and lines[-1].strip() == "```":
+                        content = "\n".join(lines[1:-1]).strip()
 
                 data = json.loads(content)
                 if isinstance(data, dict):
@@ -258,62 +217,43 @@ class SentimentAgent:
             "Your saved entry is preserved; retry analysis later."
         )
 
-    def _request(self, payload: dict) -> dict:
-        if inference_provider() == "huggingface":
-            try:
-                # content = generate_response(
-                #     system_prompt=payload["messages"][0]["content"],
-                #     user_prompt=payload["messages"][1]["content"],
-                #     model=self.model,
-                #     temperature=0,
-                #     max_tokens=1600,
-                #     timeout=self.timeout,
-                # )
-                content = generate_response(
-                system_prompt=payload["messages"][0]["content"],
-                user_prompt=payload["messages"][1]["content"],
+    def _request(self, messages: list[dict[str, str]]) -> str:
+        """Return model response text from Hugging Face chat completions."""
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        if not token:
+            raise SentimentAgentError(
+                "Missing HF_TOKEN. Configure it in .env or Streamlit secrets."
+            )
+        try:
+            client = InferenceClient(
+                api_key=token,
+                provider=self.provider,
+                timeout=self.timeout,
+            )
+            response = client.chat.completions.create(
                 model=self.model,
+                messages=messages,
                 temperature=0,
                 max_tokens=1600,
-                timeout=self.timeout,
-                json_schema=OUTPUT_SCHEMA,  # NEW
-)
-            except Exception as exc:
-                raise SentimentAgentError(f"Hugging Face inference failed: {exc}") from exc
-            # Adapt text output to the existing response parsing/validation pipeline.
-            return {"done": True, "message": {"content": content}}
-
-        request = Request(
-            OLLAMA_URL,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        # Explicitly bypass environment proxies for journal privacy.
-        opener = build_opener(ProxyHandler({}), _NoRedirects())
-        try:
-            with opener.open(request, timeout=self.timeout) as response:
-                data = json.load(response)
-        except HTTPError as exc:
-            if exc.code == 404:
-                raise SentimentAgentError(
-                    f"Local model unavailable. Run: ollama pull {self.model}"
-                ) from None
+                stream=False,
+            )
+            if not response.choices:
+                raise _InvalidOutput("No response choices")
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                raise _InvalidOutput("Missing response text")
+            if response.choices[0].finish_reason == "length":
+                raise _InvalidOutput("Output token limit reached")
+            return content
+        except _InvalidOutput:
+            raise
+        except Exception as exc:
+            # Do not log prompts or private journal content.
             raise SentimentAgentError(
-                f"Local Ollama request failed (HTTP {exc.code})."
-            ) from None
-        except (URLError, TimeoutError, OSError):
-            raise SentimentAgentError(
-                "Cannot reach local Ollama or the request timed out. "
-                "Start Ollama (or run ollama serve), then retry. "
-                "If inference is slow, increase the agent timeout."
-            ) from None
-        except (json.JSONDecodeError, UnicodeError):
-            raise _InvalidOutput("Invalid server response") from None
-        if not isinstance(data, dict):
-            raise _InvalidOutput("Invalid server response")
-        if "error" in data:
-            raise SentimentAgentError("Local Ollama reported an inference error.")
-        return data
+                f"Hugging Face inference failed ({type(exc).__name__}). "
+                "Check HF_TOKEN, HF_SENTIMENT_MODEL and your enabled inference providers. "
+                "Ensure the model supports chat completions."
+            ) from exc
 
     @staticmethod
     def _validate(data: object, text: str) -> None:
@@ -344,7 +284,7 @@ class SentimentAgent:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze a journal with local Qwen.")
+    parser = argparse.ArgumentParser(description="Analyze a journal with Hugging Face inference.")
     parser.add_argument("--demo", action="store_true", help="Analyze a fictional sample")
     args = parser.parse_args()
     if args.demo:

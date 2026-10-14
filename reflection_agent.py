@@ -75,9 +75,8 @@ REFLECTION_SCHEMA = {
 
 class ReflectionAgent:
     def __init__(self, model: str | None = None, timeout: float = 180):
-        self.model = model or (os.getenv("HF_REFLECTION_MODEL", "google/gemma-3-12b-it")
-                               if inference_provider() == "huggingface"
-                               else os.getenv("OLLAMA_REFLECTION_MODEL", "gemma3:4b"))
+        self.model = model or (os.getenv("HF_REFLECTION_MODEL", "google/gemma-3-12b-it"))
+                               
         self.timeout = timeout
 
     def reflect(self, entry: dict, history: list[dict] | None = None) -> ReflectionResult:
