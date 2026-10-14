@@ -1,4 +1,5 @@
 chroma_db/
+chroma_hf_db/
 __pycache__/
 venv/
 data/
