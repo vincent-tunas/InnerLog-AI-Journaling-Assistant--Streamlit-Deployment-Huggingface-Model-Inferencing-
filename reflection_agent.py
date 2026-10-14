@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 import json
 import os
 
-from ollama import Client
+from dotenv import load_dotenv
+from llm_model_inference import generate_response, inference_provider
+
+load_dotenv()
 from rag import retrieve_sources, KnowledgeBaseError
 
 
@@ -72,7 +75,9 @@ REFLECTION_SCHEMA = {
 
 class ReflectionAgent:
     def __init__(self, model: str | None = None, timeout: float = 180):
-        self.model = model or os.getenv("INNERLOG_REFLECTION_MODEL", "gemma3:4b")
+        self.model = model or (os.getenv("HF_REFLECTION_MODEL", "google/gemma-3-12b-it")
+                               if inference_provider() == "huggingface"
+                               else os.getenv("OLLAMA_REFLECTION_MODEL", "gemma3:4b"))
         self.timeout = timeout
 
     def reflect(self, entry: dict, history: list[dict] | None = None) -> ReflectionResult:
@@ -123,35 +128,31 @@ class ReflectionAgent:
             ],
         }
         try:
-            response = Client(host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"), timeout=self.timeout).chat(
+            raw_content = generate_response(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=json.dumps(input_data, ensure_ascii=False),
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(input_data, ensure_ascii=False)},
-                ],
-                format=REFLECTION_SCHEMA,
-                stream=False,
-                options={"temperature": 0.3, "num_ctx": 8192, "num_predict": 650},
+                temperature=0.3,
+                max_tokens=1000,
+                timeout=self.timeout,
+                json_schema=REFLECTION_SCHEMA,
             )
-            raw_content = response.message.content or ""
             try:
                 payload = json.loads(raw_content)
             except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Ollama returned invalid JSON (first 300 chars): {raw_content[:300]!r}"
-                ) from exc
+                raise ValueError("Inference provider returned invalid JSON") from exc
             if not isinstance(payload, dict):
                 raise ValueError(f"Expected a JSON object, got {type(payload).__name__}")
             for key in ("reflection", "question"):
                 value = payload.get(key)
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError(
-                        f"Missing or empty '{key}' in Ollama response; returned keys: {list(payload)}"
+                        f"Missing or empty '{key}' in inference response; returned keys: {list(payload)}"
                     )
                 if len(value) > 5000:
-                    raise ValueError(f"Unexpectedly long '{key}' in Ollama response")
+                    raise ValueError(f"Unexpectedly long '{key}' in inference response")
         except Exception as exc:
-            raise ReflectionAgentError(f"Local reflection generation failed: {exc}") from exc
+            raise ReflectionAgentError(f"Reflection generation failed: {exc}") from exc
 
         return ReflectionResult(
             reflection=payload["reflection"].strip(),

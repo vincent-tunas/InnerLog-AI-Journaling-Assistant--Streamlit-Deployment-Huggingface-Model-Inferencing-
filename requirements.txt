@@ -5,3 +5,5 @@ langchain-text-splitters
 langchain-ollama
 langchain-chroma
 pypdf
+sentence-transformers
+langchain_huggingface

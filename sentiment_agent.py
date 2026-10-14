@@ -1,4 +1,4 @@
-"""InnerLog's local sentiment agent (Python 3.10+, no pip packages needed).
+"""InnerLog's sentiment agent (local Ollama or Hugging Face inference).
 
 Setup:
     Install and start Ollama: https://ollama.com/download
@@ -11,7 +11,7 @@ Application use:
     result = agent.analyze(journal_content)
     print(result.to_dict())
 
-Only the local Ollama endpoint is contacted. No journal history is retained by
+The configured inference provider receives the journal text. No history is retained by
 this module and no journal text is logged. Analysis is a prediction of text tone,
 not a mental health diagnosis. Validate accuracy with your own journal examples.
 """
@@ -22,6 +22,8 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import os
+from old_llm_model_inference import generate_response, inference_provider
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import (
@@ -110,15 +112,56 @@ class SentimentResult:
         data["evidence"] = list(self.evidence)
         return data
 
+from difflib import SequenceMatcher
+
+
+def repair_evidence(evidence, original_text):
+    repaired = []
+
+    for quote in evidence:
+        if not isinstance(quote, str) or not quote.strip():
+            raise _InvalidOutput("Invalid evidence")
+
+        # Already an exact match
+        if quote in original_text:
+            repaired.append(quote)
+            continue
+
+        # Find a matching passage in the journal
+        match = SequenceMatcher(
+            None,
+            quote,
+            original_text,
+            autojunk=False
+        ).find_longest_match()
+
+        exact_quote = original_text[
+            match.b:match.b + match.size
+        ].strip()
+
+        # Only accept a substantial, matching passage
+        if (
+            len(exact_quote) >= 12
+            and match.size / len(quote) >= 0.7
+        ):
+            repaired.append(exact_quote)
+        else:
+            raise _InvalidOutput(
+                "Unable to recover exact evidence"
+            )
+
+    return repaired
+
 
 class SentimentAgent:
-    """A stateless local LLM wrapper: prompt, infer, validate, return."""
+    """A stateless LLM wrapper: prompt, infer, validate, return."""
 
     def __init__(self, timeout: float = 120):
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
         self.timeout = timeout
-        self.model = DEFAULT_MODEL
+        self.model = (os.getenv("HF_SENTIMENT_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+                      if inference_provider() == "huggingface" else DEFAULT_MODEL)
 
     def analyze(self, text: str) -> SentimentResult:
         if not isinstance(text, str) or not text.strip():
@@ -131,6 +174,7 @@ class SentimentAgent:
 
         # One fresh retry for malformed, truncated, or unsupported output.
         # Transport errors fail immediately; a failure is never labeled neutral.
+        last_validation_error = None
         for attempt in range(2):
             reminder = ""
             if attempt:
@@ -175,8 +219,23 @@ class SentimentAgent:
                 content = message.get("content")
                 if not isinstance(content, str):
                     raise _InvalidOutput("Missing content")
+
+
                 data = json.loads(content)
+                if isinstance(data, dict):
+                    if isinstance(data.get("evidence"), list):
+                        try:
+                            data["evidence"] = repair_evidence(
+                                data["evidence"],
+                                text
+                            )
+                        except _InvalidOutput:
+                            # Preserve the existing retry behavior
+                            raise
+
                 self._validate(data, text)
+
+                
                 return SentimentResult(
                     sentiment=data["sentiment"],
                     emotions=tuple(data["emotions"]),
@@ -185,15 +244,45 @@ class SentimentAgent:
                     model=self.model,
                     analyzed_at=datetime.now(timezone.utc).isoformat(),
                 )
-            except (json.JSONDecodeError, _InvalidOutput):
+            except (json.JSONDecodeError, _InvalidOutput) as exc:
+                # Do not log response content or journal data: only the failure category.
+                last_validation_error = (
+                    "Invalid JSON syntax" if isinstance(exc, json.JSONDecodeError)
+                    else str(exc)
+                )
                 continue
 
         raise SentimentAgentError(
             "The model did not return a valid analysis after two attempts. "
-            "Keep the entry and retry analysis later."
+            f"Last validation failure: {last_validation_error}. "
+            "Your saved entry is preserved; retry analysis later."
         )
 
     def _request(self, payload: dict) -> dict:
+        if inference_provider() == "huggingface":
+            try:
+                # content = generate_response(
+                #     system_prompt=payload["messages"][0]["content"],
+                #     user_prompt=payload["messages"][1]["content"],
+                #     model=self.model,
+                #     temperature=0,
+                #     max_tokens=1600,
+                #     timeout=self.timeout,
+                # )
+                content = generate_response(
+                system_prompt=payload["messages"][0]["content"],
+                user_prompt=payload["messages"][1]["content"],
+                model=self.model,
+                temperature=0,
+                max_tokens=1600,
+                timeout=self.timeout,
+                json_schema=OUTPUT_SCHEMA,  # NEW
+)
+            except Exception as exc:
+                raise SentimentAgentError(f"Hugging Face inference failed: {exc}") from exc
+            # Adapt text output to the existing response parsing/validation pipeline.
+            return {"done": True, "message": {"content": content}}
+
         request = Request(
             OLLAMA_URL,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
