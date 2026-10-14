@@ -54,8 +54,8 @@ Guidelines:
 
 Respond using these sections:
 Understanding, Reflection, Advice, Next Steps, Reflection Question.
-
 Ensure every response is personalized, insightful, and useful.
+
 Return ONLY a JSON object: {"reflection": "...", "question": "..."}.
 Do not add any additional JSON keys. Put the open-ended question ONLY in question.
 """
